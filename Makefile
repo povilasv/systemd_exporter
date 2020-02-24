@@ -5,7 +5,7 @@ BRANCH := $(shell git branch | grep \* | cut -d ' ' -f2)
 
 LINT_FLAGS := run --deadline=120s
 LINTER := ./bin/golangci-lint
-TESTFLAGS := -v -cover
+TEST_FLAGS := -v -cover -race -coverprofile=coverage.txt -covermode=atomic
 
 GO111MODULE := on
 all: $(LINTER) deps test lint build
@@ -23,7 +23,12 @@ deps:
 
 .PHONY: test
 test:
-	go test $(TESTFLAGS) ./...
+ifdef TRAVIS
+	sudo sh -c 'echo DefaultCPUAccounting=yes >> /etc/systemd/system.conf'  
+	sudo sh -c 'echo DefaultMemoryAccounting=yes >> /etc/systemd/system.conf'
+	sudo systemctl daemon-reload
+endif 
+	go test $(TEST_FLAGS) ./...
 
 .PHONY: build
 build: deps

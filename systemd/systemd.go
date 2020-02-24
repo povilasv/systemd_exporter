@@ -3,6 +3,8 @@ package systemd
 import (
 	"fmt"
 	"math"
+	"os"
+
 	// Register pprof-over-http handlers
 	_ "net/http/pprof"
 	"regexp"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/coreos/go-systemd/dbus"
 	"github.com/pkg/errors"
+	"github.com/povilasv/systemd_exporter/cgroup"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/procfs"
@@ -55,11 +58,17 @@ type Collector struct {
 	socketRefusedConnectionsDesc  *prometheus.Desc
 	cpuTotalDesc                  *prometheus.Desc
 	unitCPUTotal                  *prometheus.Desc
-	openFDs                       *prometheus.Desc
-	maxFDs                        *prometheus.Desc
-	vsize                         *prometheus.Desc
-	maxVsize                      *prometheus.Desc
-	rss                           *prometheus.Desc
+
+	unitMemCache *prometheus.Desc
+	unitMemRss   *prometheus.Desc
+	unitMemDirty *prometheus.Desc
+	unitMemShmem *prometheus.Desc
+
+	openFDs  *prometheus.Desc
+	maxFDs   *prometheus.Desc
+	vsize    *prometheus.Desc
+	maxVsize *prometheus.Desc
+	rss      *prometheus.Desc
 
 	unitWhitelistPattern *regexp.Regexp
 	unitBlacklistPattern *regexp.Regexp
@@ -134,6 +143,27 @@ func NewCollector(logger log.Logger) (*Collector, error) {
 		[]string{"name", "type", "mode"}, nil,
 	)
 
+	unitMemCache := prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "unit_cached_bytes"),
+		"Unit Page CacheBytes",
+		[]string{"name", "type"}, nil,
+	)
+	unitMemRss := prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "unit_rss_bytes"),
+		"Unit anon+swap cache, incl. transparent hugepages. Not true RSS",
+		[]string{"name", "type"}, nil,
+	)
+	unitMemDirty := prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "unit_dirty_bytes"),
+		"Unit bytes waiting to get written to disk",
+		[]string{"name", "type"}, nil,
+	)
+	unitMemShmem := prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "unit_shmem_bytes"),
+		"",
+		[]string{"name", "type"}, nil,
+	)
+
 	openFDs := prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "", "process_open_fds"),
 		"Number of open file descriptors.",
@@ -179,6 +209,10 @@ func NewCollector(logger log.Logger) (*Collector, error) {
 		socketRefusedConnectionsDesc:  socketRefusedConnectionsDesc,
 		cpuTotalDesc:                  cpuTotalDesc,
 		unitCPUTotal:                  unitCPUTotal,
+		unitMemCache:                  unitMemCache,
+		unitMemRss:                    unitMemRss,
+		unitMemDirty:                  unitMemDirty,
+		unitMemShmem:                  unitMemShmem,
 		openFDs:                       openFDs,
 		maxFDs:                        maxFDs,
 		vsize:                         vsize,
@@ -222,6 +256,13 @@ func parseUnitType(unit dbus.UnitStatus) string {
 	return t[len(t)-1]
 }
 
+// parseUnitTypeInterface extracts the dbus interface suffix for the interface unique to the passed unit type.
+// For example, a systemd "service unit" will be are exposed on dbus as "service objects", and all "service objects"
+// implement the org.freedesktop.systemd1.Service interface. This is used as input for dbus.GetUnitTypeProperty
+func parseUnitTypeInterface(unit dbus.UnitStatus) string {
+	return strings.Title(parseUnitType(unit))
+}
+
 func (c *Collector) collect(ch chan<- prometheus.Metric) error {
 	begin := time.Now()
 	conn, err := c.newDbus()
@@ -260,77 +301,75 @@ func (c *Collector) collectUnit(conn *dbus.Conn, ch chan<- prometheus.Metric, un
 
 	logger := c.logger.With("unit", unit.Name)
 
-	// Collect unit_state for all
+	// Collect unit_state for all unit types
 	err := c.collectUnitState(conn, ch, unit)
 	if err != nil {
 		logger.Warnf(errUnitMetricsMsg, err)
 		// TODO should we continue processing here?
 	}
 
-	switch {
-	case strings.HasSuffix(unit.Name, ".service"):
+	// Collect metrics from cgroups
+	switch parseUnitType(unit) {
+	case "service", "mount", "socket", "swap", "slice":
+		cgroupPath, err := c.getControlGroup(conn, unit)
+		if err != nil {
+			logger.Warnf(errUnitMetricsMsg, err)
+		}
+		// Everything below requires a cgroup
+		if cgroupPath == nil {
+			break
+		}
+		err = c.collectUnitCPUMetrics(*cgroupPath, conn, ch, unit)
+		if err != nil {
+			// Most sockets do not have a cpu cgroupfs entry, but a few big ones do (notably docker.socket). Quiet down
+			// error reporting if error came from a socket
+			if parseUnitType(unit) != "socket" {
+				logger.Warnf(errUnitMetricsMsg, err)
+			}
+		}
+		err = c.collectUnitMemMetrics(*cgroupPath, conn, ch, unit)
+		if err != nil {
+			logger.Warnf(errUnitMetricsMsg, err)
+		}
+	}
+
+	// Collect metrics from dbus
+	switch parseUnitType(unit) {
+	case "service":
 		err = c.collectServiceMetainfo(conn, ch, unit)
 		if err != nil {
 			logger.Warnf(errUnitMetricsMsg, err)
 		}
-
 		err = c.collectServiceStartTimeMetrics(conn, ch, unit)
 		if err != nil {
 			logger.Warnf(errUnitMetricsMsg, err)
 		}
-
 		if *enableRestartsMetrics {
 			err = c.collectServiceRestartCount(conn, ch, unit)
 			if err != nil {
 				logger.Warnf(errUnitMetricsMsg, err)
 			}
 		}
-
 		err = c.collectServiceTasksMetrics(conn, ch, unit)
 		if err != nil {
 			logger.Warnf(errUnitMetricsMsg, err)
 		}
-
 		err = c.collectServiceProcessMetrics(conn, ch, unit)
 		if err != nil {
 			logger.Warnf(errUnitMetricsMsg, err)
 		}
-		err = c.collectUnitCPUUsageMetrics("Service", conn, ch, unit)
-		if err != nil {
-			logger.Warnf(errUnitMetricsMsg, err)
-		}
-	case strings.HasSuffix(unit.Name, ".mount"):
+	case "mount":
 		err = c.collectMountMetainfo(conn, ch, unit)
 		if err != nil {
 			logger.Warnf(errUnitMetricsMsg, err)
 		}
-		err = c.collectUnitCPUUsageMetrics("Mount", conn, ch, unit)
-		if err != nil {
-			logger.Warnf(errUnitMetricsMsg, err)
-		}
-	case strings.HasSuffix(unit.Name, ".timer"):
+	case "timer":
 		err := c.collectTimerTriggerTime(conn, ch, unit)
 		if err != nil {
 			logger.Warnf(errUnitMetricsMsg, err)
 		}
-	case strings.HasSuffix(unit.Name, ".socket"):
+	case "socket":
 		err := c.collectSocketConnMetrics(conn, ch, unit)
-		if err != nil {
-			logger.Warnf(errUnitMetricsMsg, err)
-		}
-		// Most sockets do not have a cpu cgroupfs entry, but a
-		// few do, notably docker.socket
-		err = c.collectUnitCPUUsageMetrics("Socket", conn, ch, unit)
-		if err != nil {
-			logger.Warnf(errUnitMetricsMsg, err)
-		}
-	case strings.HasSuffix(unit.Name, ".swap"):
-		err = c.collectUnitCPUUsageMetrics("Swap", conn, ch, unit)
-		if err != nil {
-			logger.Warnf(errUnitMetricsMsg, err)
-		}
-	case strings.HasSuffix(unit.Name, ".slice"):
-		err = c.collectUnitCPUUsageMetrics("Slice", conn, ch, unit)
 		if err != nil {
 			logger.Warnf(errUnitMetricsMsg, err)
 		}
@@ -515,16 +554,15 @@ func (c *Collector) mustGetUnitStringTypeProperty(unitType string,
 	return propVal
 }
 
-// A number of unit types support the 'ControlGroup' property needed to allow us to directly read their
-// resource usage from the kernel's cgroupfs cpu hierarchy. The only change is which dbus item we are querying
-func (c *Collector) collectUnitCPUUsageMetrics(unitType string, conn *dbus.Conn, ch chan<- prometheus.Metric, unit dbus.UnitStatus) error {
-	propCGSubpath, err := conn.GetUnitTypeProperty(unit.Name, unitType, "ControlGroup")
+func (c *Collector) getControlGroup(conn *dbus.Conn, unit dbus.UnitStatus) (*string, error) {
+	unitTypeInterface := parseUnitTypeInterface(unit)
+	propCGSubpath, err := conn.GetUnitTypeProperty(unit.Name, unitTypeInterface, "ControlGroup")
 	if err != nil {
-		return errors.Wrapf(err, errGetPropertyMsg, "ControlGroup")
+		return nil, errors.Wrapf(err, errGetPropertyMsg, "ControlGroup")
 	}
 	cgSubpath, ok := propCGSubpath.Value.Value().(string)
 	if !ok {
-		return errors.Errorf(errConvertStringPropertyMsg, "ControlGroup", propCGSubpath.Value.Value())
+		return nil, errors.Errorf(errConvertStringPropertyMsg, "ControlGroup", propCGSubpath.Value.Value())
 	}
 
 	switch {
@@ -532,37 +570,32 @@ func (c *Collector) collectUnitCPUUsageMetrics(unitType string, conn *dbus.Conn,
 		cgSubpath == "" && unit.ActiveState == "failed":
 		// Expected condition, systemd has cleaned up and
 		// we have nothing to record
-		return nil
+		return nil, nil
 	case cgSubpath == "" && unit.ActiveState == "active":
 		// Unexpected. Why is there no cgroup on an active unit?
-		subType := c.mustGetUnitStringTypeProperty(unitType, "Type", "unknown", conn, unit)
-		slice := c.mustGetUnitStringTypeProperty(unitType, "Slice", "unknown", conn, unit)
-		return errors.Errorf("got 'no cgroup' from systemd for active unit (state=%s subtype=%s slice=%s)", unit.ActiveState, subType, slice)
+		subType := c.mustGetUnitStringTypeProperty(unitTypeInterface, "Type", "unknown", conn, unit)
+		slice := c.mustGetUnitStringTypeProperty(unitTypeInterface, "Slice", "unknown", conn, unit)
+		return nil, errors.Errorf("got 'no cgroup' from systemd for active unit (state=%s subtype=%s slice=%s)", unit.ActiveState, subType, slice)
 	case cgSubpath == "":
 		// We are likely reading a unit that is currently changing state, so
 		// we record this and bail
-		subType := c.mustGetUnitStringTypeProperty(unitType, "Type", "unknown", conn, unit)
-		slice := c.mustGetUnitStringTypeProperty(unitType, "Slice", "unknown", conn, unit)
+		subType := c.mustGetUnitStringTypeProperty(unitTypeInterface, "Type", "unknown", conn, unit)
+		slice := c.mustGetUnitStringTypeProperty(unitTypeInterface, "Slice", "unknown", conn, unit)
 		log.Debugf("Read 'no cgroup' from unit (name=%s state=%s subtype=%s slice=%s) ", unit.Name, unit.ActiveState, subType, slice)
-		return nil
+		return nil, nil
+	default:
+		return &cgSubpath, nil
 	}
+}
 
-	propCPUAcct, err := conn.GetUnitTypeProperty(unit.Name, unitType, "CPUAccounting")
+// A number of unit types support the 'ControlGroup' property needed to allow us to directly read their
+// resource usage from the kernel's cgroupfs cpu hierarchy. The only change is which dbus item we are querying
+func (c *Collector) collectUnitCPUMetrics(cgSubpath string, conn *dbus.Conn, ch chan<- prometheus.Metric, unit dbus.UnitStatus) error {
+	// Don't bother reading CPUAccounting prop. It's faster to attempt a file read than to query dbus, and it works
+	// in more situations as well
+	cpuUsage, err := cgroup.NewCPUAcct(cgSubpath)
 	if err != nil {
-		return errors.Wrapf(err, errGetPropertyMsg, "CPUAccounting")
-	}
-	cpuAcct, ok := propCPUAcct.Value.Value().(bool)
-	if !ok {
-		return errors.Errorf(errConvertStringPropertyMsg, "CPUAccounting", propCPUAcct.Value.Value())
-	}
-	if !cpuAcct {
-		return nil
-	}
-
-	cpuUsage, err := NewCPUAcct(cgSubpath)
-	if err != nil {
-		if unitType == "Socket" {
-			log.Debugf("unable to read SocketUnit CPU accounting information (unit=%s)", unit.Name)
+		if perr, ok := err.(*os.PathError); ok && perr.Op == "open" {
 			return nil
 		}
 		return errors.Wrapf(err, errControlGroupReadMsg, "CPU usage")
@@ -577,6 +610,36 @@ func (c *Collector) collectUnitCPUUsageMetrics(unitType string, conn *dbus.Conn,
 	ch <- prometheus.MustNewConstMetric(
 		c.unitCPUTotal, prometheus.CounterValue,
 		sysSeconds, unit.Name, parseUnitType(unit), "system")
+
+	return nil
+}
+
+func (c *Collector) collectUnitMemMetrics(cgSubpath string, conn *dbus.Conn, ch chan<- prometheus.Metric, unit dbus.UnitStatus) error {
+	// Don't bother reading MemoryAccounting prop. It's faster to attempt a file read than to query dbus, and it works
+	// in more situations as well. For ex: case where
+	// such as kernel cmdline has cgroups_enabled=memory but systemd still has DefaultMemoryAccounting=no. All cgroups
+	// will have a memory.stat file, but systemd will still report MemoryAccounting=false for most units
+	memStat, err := cgroup.NewMemStat(cgSubpath)
+	if err != nil {
+		if perr, ok := err.(*os.PathError); ok && perr.Op == "open" {
+			return nil
+		}
+		return errors.Wrapf(err, errControlGroupReadMsg, "Memory stat")
+	}
+
+	unitType := parseUnitType(unit)
+	ch <- prometheus.MustNewConstMetric(
+		c.unitMemCache, prometheus.GaugeValue,
+		float64(memStat.CacheBytes), unit.Name, unitType)
+	ch <- prometheus.MustNewConstMetric(
+		c.unitMemRss, prometheus.GaugeValue,
+		float64(memStat.RssBytes), unit.Name, unitType)
+	ch <- prometheus.MustNewConstMetric(
+		c.unitMemDirty, prometheus.GaugeValue,
+		float64(memStat.DirtyBytes), unit.Name, unitType)
+	ch <- prometheus.MustNewConstMetric(
+		c.unitMemShmem, prometheus.GaugeValue,
+		float64(memStat.Shmem), unit.Name, unitType)
 
 	return nil
 }
@@ -605,7 +668,7 @@ func (c *Collector) collectSocketConnMetrics(conn *dbus.Conn, ch chan<- promethe
 		return errors.Wrapf(err, errGetPropertyMsg, "NRefused")
 	}
 	ch <- prometheus.MustNewConstMetric(
-		c.socketRefusedConnectionsDesc, prometheus.GaugeValue,
+		c.socketRefusedConnectionsDesc, prometheus.CounterValue,
 		float64(refusedConnectionCount.Value.Value().(uint32)), unit.Name)
 
 	return nil
